@@ -39,6 +39,15 @@ fn main() {
         ["y", "yes", "true", "1"].contains(&v.to_lowercase().as_str())
     });
 
+    // Intel Quick Sync through libvpl: deps/build.sh builds libvpl only for the mingw cross build
+    // (Windows target, Linux host); build scripts are compiled for the host, hence cfg!.
+    let has_qsv = target_os == "windows"
+        && cfg!(target_os = "linux")
+        && env::var("CARGO_FEATURE_FFMPEG_SYSTEM").is_err();
+    if target_os == "windows" {
+        println!("cargo:warning=weylus build: target_os={target_os} qsv={has_qsv}");
+    }
+
     if env::var("CARGO_FEATURE_FFMPEG_SYSTEM").is_err() {
         build_ffmpeg(&dist_dir, enable_libnpp);
     }
@@ -122,6 +131,13 @@ fn main() {
     println!("cargo:rustc-link-lib={}=swscale", ffmpeg_link_kind);
     println!("cargo:rustc-link-lib={}=avutil", ffmpeg_link_kind);
     println!("cargo:rustc-link-lib={}=x264", ffmpeg_link_kind);
+    if has_qsv {
+        // after the FFmpeg libraries that call it (libavutil's QSV hwcontext, libavcodec's h264_qsv)
+        println!("cargo:rustc-link-lib={}=vpl", ffmpeg_link_kind);
+        // libvpl is C++. Its runtime goes in statically: weylus.exe ships alone, with no
+        // libstdc++-6.dll beside it (docker_build.sh fails the build if it would need one).
+        println!("cargo:rustc-link-lib=static=stdc++");
+    }
     if enable_libnpp {
         if let Ok(lib_paths) = env::var("LIBRARY_PATH") {
             for lib_path in lib_paths.split(':') {
@@ -158,6 +174,12 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=vfw32");
         println!("cargo:rustc-link-lib=dylib=shlwapi");
         println!("cargo:rustc-link-lib=dylib=bcrypt");
+        if has_qsv {
+            // what libvpl's vpl.pc lists for mingw (ole32 is above), plus advapi32 for its registry reads
+            println!("cargo:rustc-link-lib=dylib=gdi32");
+            println!("cargo:rustc-link-lib=dylib=uuid");
+            println!("cargo:rustc-link-lib=dylib=advapi32");
+        }
     }
 }
 

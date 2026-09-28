@@ -14,3 +14,7 @@ NV_CODEC_REF="HEAD"
 
 LIBVA_URL="https://github.com/intel/libva"
 LIBVA_REF="refs/tags/2.23.0"
+
+# Windows (mingw cross build) only: the oneVPL dispatcher for Intel Quick Sync
+LIBVPL_URL="https://github.com/intel/libvpl.git"
+LIBVPL_REF="refs/tags/v2.17.0"

@@ -5,6 +5,14 @@ set -ex
 # cross compile windows version
 cargo build --target x86_64-pc-windows-gnu --release
 
+# weylus.exe ships alone in the zip: it must not need a MinGW runtime DLL (libvpl brings in C++)
+WIN_EXE=target/x86_64-pc-windows-gnu/release/weylus.exe
+x86_64-w64-mingw32-objdump -p "$WIN_EXE" | grep 'DLL Name' | sort -u
+if x86_64-w64-mingw32-objdump -p "$WIN_EXE" | grep -iE 'DLL Name: (libstdc|libgcc|libwinpthread)'; then
+    echo "weylus.exe imports a MinGW runtime DLL; link it statically"
+    exit 1
+fi
+
 # cleanup cross compiled windows artifacts
 (cd deps && ./clean.sh)
 

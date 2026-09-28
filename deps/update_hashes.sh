@@ -28,6 +28,7 @@ $(resolve X264      "$X264_URL"     "$X264_REF")
 $(resolve FFMPEG    "$FFMPEG_URL"   "$FFMPEG_REF")
 $(resolve NV_CODEC  "$NV_CODEC_URL" "$NV_CODEC_REF")
 $(resolve LIBVA     "$LIBVA_URL"    "$LIBVA_REF")
+$(resolve LIBVPL    "$LIBVPL_URL"   "$LIBVPL_REF")
 EOF
 
 echo "hashes.sh updated."

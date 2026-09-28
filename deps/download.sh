@@ -24,6 +24,9 @@ fi
 if [ "$TARGET_OS" == "windows" ]; then
     clone_at_commit "$NV_CODEC_URL" nv-codec-headers "$NV_CODEC_COMMIT"
 fi
+if [ "$TARGET_OS" == "windows" ] && [ "$HOST_OS" == "linux" ]; then
+    clone_at_commit "$LIBVPL_URL" libvpl "$LIBVPL_COMMIT"
+fi
 
 if [ "$TARGET_OS" == "windows" ] && [ "$HOST_OS" == "windows" ]; then
     cd ffmpeg
