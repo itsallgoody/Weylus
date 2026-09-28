@@ -36,6 +36,11 @@ impl Capturable for CaptrsCapturable {
     fn recorder(&self, _capture_cursor: bool) -> Result<Box<dyn Recorder>, Box<dyn Error>> {
         Ok(Box::new(CaptrsRecorder::new(self.id)?))
     }
+    /// id is the index into WinCtx's outputs, which are adapter 0's DXGI outputs in EnumOutputs
+    /// order, the same list ddagrab's output_idx indexes (vsrc_ddagrab.c init_dxgi_dda).
+    fn dda_output(&self) -> Option<u32> {
+        Some(self.id as u32)
+    }
     fn geometry(&self) -> Result<Geometry, Box<dyn Error>> {
         Ok(Geometry::VirtualScreen(
             self.screen.left - self.virtual_screen.left,

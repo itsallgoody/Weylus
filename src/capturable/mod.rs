@@ -55,6 +55,13 @@ pub trait Capturable: Send + BoxCloneCapturable {
 
     /// Return a Recorder that can record the current capturable.
     fn recorder(&self, capture_cursor: bool) -> Result<Box<dyn Recorder>, Box<dyn Error>>;
+
+    /// Windows: the DXGI output index on adapter 0 (ddagrab's output_idx) when this capturable is
+    /// a whole output, so it can take the GPU path (VideoEncoder::new_dda) instead of `recorder`.
+    #[cfg(target_os = "windows")]
+    fn dda_output(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl Clone for Box<dyn Capturable> {

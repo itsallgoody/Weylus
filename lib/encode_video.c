@@ -982,3 +982,376 @@ void fill_rgb0(VideoContext* ctx, const void* data, Error* err)
 	OK_OR_ABORT(err)
 	ctx->frame = scaler->frame_out;
 }
+
+#if defined(_WIN32)
+/*
+ * The GPU-resident Windows path: the desktop never leaves the GPU.
+ *
+ *   ddagrab (Desktop Duplication, D3D11 textures on adapter 0)
+ *     -> hwmap=derive_device=qsv -> format=qsv
+ *     -> scale_qsv (BGRA -> NV12, and down to the client's max size)
+ *     -> h264_qsv (low power, async_depth 1, no look-ahead, no B-frames)
+ *     -> fragmented MP4 (delay_moov), same stream as the other encoders.
+ *
+ * Measured on the Worker PC (i9-13900H, Iris Xe) with ffmpeg's command line: 56-59 fps at
+ * 2304x1296 for 0.34 cores. The captrs path copies every 4K frame to the CPU.
+ *
+ * One desktop duplication per output per process: the Rust side drops the captrs recorder
+ * before it builds this, and drops this (destroy_video_encoder_dda) before it falls back.
+ */
+
+#include <libavutil/time.h>
+
+typedef struct DdaContext
+{
+	void* rust_ctx;
+	AVBufferRef* device;
+	AVFilterGraph* graph;
+	AVFilterContext* src;
+	AVFilterContext* sink;
+	AVCodecContext* c;
+	AVFormatContext* oc;
+	AVStream* st;
+	AVPacket* pkt;
+	AVFrame* frame;
+	int header_written;
+	int moov_flushed;
+	int width_in;
+	int height_in;
+	int width_out;
+	int height_out;
+} DdaContext;
+
+void destroy_video_encoder_dda(DdaContext* ctx)
+{
+	if (!ctx)
+		return;
+	if (ctx->header_written)
+		av_write_trailer(ctx->oc);
+	if (ctx->oc)
+	{
+		if (ctx->oc->pb)
+		{
+			// libavformat may replace the buffer; free the one it holds (avio_alloc_context docs)
+			av_freep(&ctx->oc->pb->buffer);
+			avio_context_free(&ctx->oc->pb);
+		}
+		avformat_free_context(ctx->oc);
+	}
+	// the consumer before the producer: encoder, then the graph (which ends the duplication)
+	avcodec_free_context(&ctx->c);
+	av_packet_free(&ctx->pkt);
+	av_frame_free(&ctx->frame);
+	avfilter_graph_free(&ctx->graph);
+	av_buffer_unref(&ctx->device);
+	free(ctx);
+}
+
+#ifdef HAS_QSV
+static int dda_filter(
+	AVFilterGraph* graph,
+	AVFilterContext** out,
+	const char* filter_name,
+	const char* args,
+	AVBufferRef* hw_device)
+{
+	const AVFilter* filter = avfilter_get_by_name(filter_name);
+	if (!filter)
+		return AVERROR_FILTER_NOT_FOUND;
+	*out = avfilter_graph_alloc_filter(graph, filter, filter_name);
+	if (!*out)
+		return AVERROR(ENOMEM);
+	// must be set before init (avfilter.h, AVFilterContext.hw_device_ctx)
+	if (hw_device)
+	{
+		(*out)->hw_device_ctx = av_buffer_ref(hw_device);
+		if (!(*out)->hw_device_ctx)
+			return AVERROR(ENOMEM);
+	}
+	return avfilter_init_str(*out, args);
+}
+
+static void dda_set_opt(AVCodecContext* c, const char* key, const char* value)
+{
+	int ret = av_opt_set(c->priv_data, key, value, 0);
+	if (ret < 0)
+		log_warn("Video: h264_qsv option %s=%s not set: %s", key, value, av_err2str(ret));
+}
+
+static void open_video_dda(
+	DdaContext* ctx, int output_idx, int max_width, int max_height, int fps, int draw_mouse, Error* err)
+{
+	int ret;
+	char args[1024];
+
+	if (max_width <= 1 || max_height <= 1)
+		ERROR(err, 1, "Invalid maximum video size: %dx%d", max_width, max_height);
+	if (fps < 1)
+		fps = 1;
+	if (fps > 120)
+		fps = 120;
+
+	// adapter 0, the adapter whose outputs src/capturable/win_ctx.rs lists
+	ret = av_hwdevice_ctx_create(&ctx->device, AV_HWDEVICE_TYPE_D3D11VA, "0", NULL, 0);
+	if (ret < 0)
+		ERROR(err, ret, "Could not create a D3D11 device on adapter 0: %s", av_err2str(ret));
+
+	ctx->graph = avfilter_graph_alloc();
+	if (!ctx->graph)
+		ERROR(err, AVERROR(ENOMEM), "Could not allocate the filter graph");
+
+	// ddagrab runs its own clock at twice the stream rate, so the Weylus loop (which paces at fps) never
+	// waits on it for more than a quarter frame (its AcquireNextFrame timeout is half its frame time);
+	// dup_frames repeats the last frame when nothing on screen changed.
+	snprintf(
+		args,
+		sizeof(args),
+		"output_idx=%d:framerate=%d:draw_mouse=%d:dup_frames=1",
+		output_idx,
+		2 * fps,
+		draw_mouse ? 1 : 0);
+	AVFilterContext *hwmap, *format, *scale;
+	if ((ret = dda_filter(ctx->graph, &ctx->src, "ddagrab", args, ctx->device)) < 0)
+		ERROR(err, ret, "ddagrab (%s) failed: %s", args, av_err2str(ret));
+	if ((ret = dda_filter(ctx->graph, &hwmap, "hwmap", "derive_device=qsv", NULL)) < 0)
+		ERROR(err, ret, "hwmap=derive_device=qsv failed: %s", av_err2str(ret));
+	if ((ret = dda_filter(ctx->graph, &format, "format", "pix_fmts=qsv", NULL)) < 0)
+		ERROR(err, ret, "format=qsv failed: %s", av_err2str(ret));
+
+	// The size rule of src/websocket.rs, in scale_qsv's expressions of the captured size (iw, ih):
+	// fit within max_width x max_height, never above 4K, never up, truncated, then even.
+	char fit[256];
+	snprintf(
+		fit,
+		sizeof(fit),
+		"min(1,min(min(%d/iw,%d/ih),min(3840/iw,2160/ih)))",
+		max_width,
+		max_height);
+	snprintf(
+		args,
+		sizeof(args),
+		"w=trunc(trunc(iw*%s)/2)*2:h=trunc(trunc(ih*%s)/2)*2:format=nv12",
+		fit,
+		fit);
+	if ((ret = dda_filter(ctx->graph, &scale, "scale_qsv", args, NULL)) < 0)
+		ERROR(err, ret, "scale_qsv (%s) failed: %s", args, av_err2str(ret));
+
+	const AVFilter* buffersink = avfilter_get_by_name("buffersink");
+	ctx->sink = avfilter_graph_alloc_filter(ctx->graph, buffersink, "out");
+	if (!ctx->sink)
+		ERROR(err, AVERROR(ENOMEM), "Could not allocate the buffer sink");
+	enum AVPixelFormat sink_fmt = AV_PIX_FMT_QSV;
+	ret = av_opt_set_array(
+		ctx->sink, "pixel_formats", AV_OPT_SEARCH_CHILDREN, 0, 1, AV_OPT_TYPE_PIXEL_FMT, &sink_fmt);
+	if (ret < 0)
+		ERROR(err, ret, "Could not set the buffer sink's format: %s", av_err2str(ret));
+	if ((ret = avfilter_init_dict(ctx->sink, NULL)) < 0)
+		ERROR(err, ret, "Could not initialize the buffer sink: %s", av_err2str(ret));
+
+	if ((ret = avfilter_link(ctx->src, 0, hwmap, 0)) < 0 ||
+		(ret = avfilter_link(hwmap, 0, format, 0)) < 0 ||
+		(ret = avfilter_link(format, 0, scale, 0)) < 0 ||
+		(ret = avfilter_link(scale, 0, ctx->sink, 0)) < 0)
+		ERROR(err, ret, "Could not link the filters: %s", av_err2str(ret));
+
+	// This starts the duplication and waits for the first desktop frame.
+	if ((ret = avfilter_graph_config(ctx->graph, NULL)) < 0)
+		ERROR(err, ret, "Could not configure ddagrab -> scale_qsv: %s", av_err2str(ret));
+
+	ctx->width_in = ctx->src->outputs[0]->w;
+	ctx->height_in = ctx->src->outputs[0]->h;
+	ctx->width_out = av_buffersink_get_w(ctx->sink);
+	ctx->height_out = av_buffersink_get_h(ctx->sink);
+	if (ctx->width_out <= 1 || ctx->height_out <= 1)
+		ERROR(
+			err,
+			1,
+			"Invalid size for video: %dx%d -> %dx%d",
+			ctx->width_in,
+			ctx->height_in,
+			ctx->width_out,
+			ctx->height_out);
+
+	AVBufferRef* frames = av_buffersink_get_hw_frames_ctx(ctx->sink);
+	if (!frames)
+		ERROR(err, 1, "scale_qsv gave no hardware frames");
+
+	const AVCodec* codec = avcodec_find_encoder_by_name("h264_qsv");
+	if (!codec)
+		ERROR(err, 1, "Codec 'h264_qsv' not found");
+	ctx->c = avcodec_alloc_context3(codec);
+	if (!ctx->c)
+		ERROR(err, AVERROR(ENOMEM), "Could not allocate the h264_qsv context");
+
+	avformat_alloc_output_context2(&ctx->oc, NULL, "mp4", NULL);
+	if (!ctx->oc)
+		ERROR(err, 1, "Could not find output format mp4.");
+
+	ctx->c->width = ctx->width_out;
+	ctx->c->height = ctx->height_out;
+	ctx->c->time_base = TIME_BASE;
+	ctx->c->framerate = (AVRational){fps, 1};
+	ctx->c->pix_fmt = AV_PIX_FMT_QSV;
+	ctx->c->hw_frames_ctx = av_buffer_ref(frames);
+	if (!ctx->c->hw_frames_ctx)
+		ERROR(err, AVERROR(ENOMEM), "Could not reference the hardware frames");
+	ctx->c->gop_size = 60;
+	ctx->c->max_b_frames = 0;
+	// ICQ at global_quality 23: Harley's pick in a blind clip test (about 5 Mbit/s, over x264 at
+	// 14 Mbit/s and QSV CBR 10M). No max-rate cap: qsvenc.c select_rc_mode picks ICQ only when
+	// rc_max_rate is 0 (with a cap and a bit rate it becomes QVBR). bit_rate is not used by ICQ;
+	// zeroed so nothing reads libavcodec's 200 kbit/s default as a target.
+	ctx->c->global_quality = 23;
+	ctx->c->bit_rate = 0;
+	ctx->c->rc_max_rate = 0;
+	ctx->c->rc_buffer_size = 0;
+	if (ctx->oc->oformat->flags & AVFMT_GLOBALHEADER)
+		ctx->c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	dda_set_opt(ctx->c, "profile", "main");
+	dda_set_opt(ctx->c, "low_power", "1");
+	dda_set_opt(ctx->c, "async_depth", "1");
+	dda_set_opt(ctx->c, "look_ahead", "0");
+
+	if ((ret = avcodec_open2(ctx->c, codec, NULL)) < 0)
+		ERROR(err, ret, "Could not open h264_qsv: %s", av_err2str(ret));
+
+	ctx->st = avformat_new_stream(ctx->oc, NULL);
+	if (!ctx->st)
+		ERROR(err, AVERROR(ENOMEM), "Could not add the video stream");
+	if ((ret = avcodec_parameters_from_context(ctx->st->codecpar, ctx->c)) < 0)
+		ERROR(err, ret, "Could not copy the codec parameters: %s", av_err2str(ret));
+
+	ctx->pkt = av_packet_alloc();
+	ctx->frame = av_frame_alloc();
+	if (!ctx->pkt || !ctx->frame)
+		ERROR(err, AVERROR(ENOMEM), "Failed to allocate packet or frame");
+
+	int buf_size = 1024 * 1024;
+	void* buf = av_malloc(buf_size);
+	if (!buf)
+		ERROR(err, AVERROR(ENOMEM), "Failed to allocate the avio buffer");
+	ctx->oc->pb = avio_alloc_context(
+		buf, buf_size, AVIO_FLAG_WRITE, ctx->rust_ctx, NULL, write_video_packet, NULL);
+	if (!ctx->oc->pb)
+	{
+		av_free(buf);
+		ERROR(err, AVERROR(ENOMEM), "Failed to allocate avio context");
+	}
+
+	// As for h264_mf: the moov is written from the first packet (see open_video).
+	AVDictionary* opt = NULL;
+	av_dict_set(&opt, "movflags", "frag_custom+delay_moov+default_base_moof", 0);
+	av_dict_set(&opt, "use_editlist", "0", 0);
+	ret = avformat_write_header(ctx->oc, &opt);
+	av_dict_free(&opt);
+	if (ret < 0)
+		ERROR(err, ret, "Video: failed to write header: %s", av_err2str(ret));
+	ctx->header_written = 1;
+
+	log_info(
+		"Video: dda+qsv output=%d %dx%d->%dx%d@h264_qsv fps=%d ddagrab_rate=%d draw_mouse=%d rc=icq "
+		"global_quality=%d max_rate=none profile=main gop=%d b_frames=0 low_power=1 async_depth=1 "
+		"movflags=delay_moov",
+		output_idx,
+		ctx->width_in,
+		ctx->height_in,
+		ctx->width_out,
+		ctx->height_out,
+		fps,
+		2 * fps,
+		draw_mouse ? 1 : 0,
+		ctx->c->global_quality,
+		ctx->c->gop_size);
+}
+#endif
+
+// Returns NULL, with err filled, on any failure; everything built so far is released again.
+DdaContext* init_video_encoder_dda(
+	void* rust_ctx,
+	int output_idx,
+	int max_width,
+	int max_height,
+	int fps,
+	int draw_mouse,
+	Error* err)
+{
+	DdaContext* ctx = calloc(1, sizeof(DdaContext));
+	if (!ctx)
+	{
+		fill_error(err, 1, "Out of memory");
+		return NULL;
+	}
+	ctx->rust_ctx = rust_ctx;
+#ifdef HAS_QSV
+	open_video_dda(ctx, output_idx, max_width, max_height, fps, draw_mouse, err);
+#else
+	(void)output_idx;
+	(void)max_width;
+	(void)max_height;
+	(void)fps;
+	(void)draw_mouse;
+	fill_error(err, 1, "This build has no Intel Quick Sync (libvpl): no GPU capture path");
+#endif
+	if (err->code)
+	{
+		destroy_video_encoder_dda(ctx);
+		return NULL;
+	}
+	return ctx;
+}
+
+void video_encoder_dda_size(
+	DdaContext* ctx, int* width_in, int* height_in, int* width_out, int* height_out)
+{
+	*width_in = ctx->width_in;
+	*height_in = ctx->height_in;
+	*width_out = ctx->width_out;
+	*height_out = ctx->height_out;
+}
+
+// got_frame: 1 if a frame was encoded, 0 if ddagrab had none yet. capture_us: time spent getting the
+// frame out of the graph (duplication, BGRA -> NV12, scaling). An error means the duplication or the
+// encoder is gone (lock screen, UAC, mode change): destroy and build again.
+void encode_video_frame_dda(DdaContext* ctx, int millis, int* got_frame, int* capture_us, Error* err)
+{
+	*got_frame = 0;
+	*capture_us = 0;
+	int64_t t0 = av_gettime_relative();
+	int ret = av_buffersink_get_frame(ctx->sink, ctx->frame);
+	*capture_us = (int)(av_gettime_relative() - t0);
+	if (ret == AVERROR(EAGAIN))
+		return;
+	if (ret < 0)
+		ERROR(err, ret, "Desktop duplication (ddagrab) stopped: %s", av_err2str(ret));
+
+	ctx->frame->pts = millis;
+	ret = avcodec_send_frame(ctx->c, ctx->frame);
+	av_frame_unref(ctx->frame);
+	if (ret < 0)
+		ERROR(err, ret, "h264_qsv refused a frame: %s", av_err2str(ret));
+	*got_frame = 1;
+
+	while (1)
+	{
+		ret = avcodec_receive_packet(ctx->c, ctx->pkt);
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+			return;
+		if (ret < 0)
+			ERROR(err, ret, "h264_qsv failed: %s", av_err2str(ret));
+
+		av_packet_rescale_ts(ctx->pkt, ctx->c->time_base, ctx->st->time_base);
+		ret = av_write_frame(ctx->oc, ctx->pkt);
+		av_packet_unref(ctx->pkt);
+		if (ret < 0)
+			ERROR(err, ret, "Muxing a video packet failed: %s", av_err2str(ret));
+
+		// new fragment on every frame; the very first flush writes only ftyp+moov (delay_moov)
+		av_write_frame(ctx->oc, NULL);
+		if (!ctx->moov_flushed)
+		{
+			av_write_frame(ctx->oc, NULL);
+			ctx->moov_flushed = 1;
+		}
+	}
+}
+#endif

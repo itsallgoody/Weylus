@@ -310,6 +310,9 @@ struct VideoStats {
     capture: Duration,
     encode: Duration,
     size: (usize, usize, usize, usize),
+    /// Windows: "dda_qsv" (the GPU path) or "captrs"
+    #[cfg(target_os = "windows")]
+    path: &'static str,
 }
 
 impl VideoStats {
@@ -322,6 +325,8 @@ impl VideoStats {
             capture: Duration::ZERO,
             encode: Duration::ZERO,
             size: (0, 0, 0, 0),
+            #[cfg(target_os = "windows")]
+            path: "captrs",
         }
     }
 
@@ -339,8 +344,12 @@ impl VideoStats {
                 }
             };
             let (wi, hi, wo, ho) = self.size;
+            #[cfg(target_os = "windows")]
+            let path = format!(" path={}", self.path);
+            #[cfg(not(target_os = "windows"))]
+            let path = "";
             info!(
-                "Video stats: fps={:.1} capture_ms={:.1} encode_ms={:.1} timeouts={} errors={} size={}x{}->{}x{}",
+                "Video stats: fps={:.1} capture_ms={:.1} encode_ms={:.1} timeouts={} errors={} size={}x{}->{}x{}{}",
                 self.frames as f64 / secs,
                 per(self.capture),
                 per(self.encode),
@@ -349,10 +358,246 @@ impl VideoStats {
                 wi,
                 hi,
                 wo,
-                ho
+                ho,
+                path
             );
         }
         *self = Self::new();
+    }
+}
+
+/// Windows GPU path: WEYLUS_DDA=0 (or false/off/no) turns it off, so a shop PC can go back to
+/// captrs without a rebuild.
+#[cfg(target_os = "windows")]
+fn dda_enabled() -> bool {
+    match std::env::var("WEYLUS_DDA") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// After the first failure the GPU path is rebuilt, retrying every 250 ms for up to 4 s (the patience
+/// of the captrs capture retry: right after a wake, sign-in or mode change Windows refuses the
+/// duplication for a moment). A second failure before it is healthy again falls back to captrs.
+#[cfg(target_os = "windows")]
+const DDA_REBUILD_PATIENCE: Duration = Duration::from_secs(4);
+#[cfg(target_os = "windows")]
+const DDA_RETRY_EVERY: Duration = Duration::from_millis(250);
+/// Frames after a (re)build that count as healthy: the next failure gets its own rebuild.
+#[cfg(target_os = "windows")]
+const DDA_HEALTHY_FRAMES: u64 = 300;
+
+/// The GPU path's state for the capturable chosen by the last Start (Windows).
+#[cfg(target_os = "windows")]
+struct DdaTarget {
+    output: u32,
+    capture_cursor: bool,
+    fps: u32,
+    /// failures since the last healthy stretch
+    failures: u32,
+    /// frames encoded since the encoder was (re)built
+    frames: u64,
+    /// while rebuilding after a failure: when the rebuild's patience runs out
+    rebuild_until: Option<Instant>,
+    /// no build attempt before this
+    next_try: Instant,
+}
+
+#[cfg(target_os = "windows")]
+enum DdaTick {
+    /// not on the GPU path: record with the recorder (captrs)
+    NotUsed,
+    /// the GPU path handled this tick
+    Done,
+    /// the GPU path gave up: switch to captrs now (its encoder, and so its duplication, is gone)
+    FallBack,
+}
+
+/// On Start (Windows): take the GPU path when the capturable is a DXGI output and WEYLUS_DDA allows.
+/// Returns true when it did. Whatever GPU encoder ran before is dropped first: it holds a desktop
+/// duplication, and Windows allows one per output per process.
+#[cfg(target_os = "windows")]
+fn dda_start(
+    dda: &mut Option<DdaTarget>,
+    video_encoder: &mut Option<Box<VideoEncoder>>,
+    fallback: &mut Option<(Box<dyn Capturable>, bool)>,
+    config: &VideoConfig,
+) -> bool {
+    if dda.take().is_some() {
+        *video_encoder = None;
+    }
+    *fallback = Some((config.capturable.clone(), config.capture_cursor));
+    let enabled = dda_enabled();
+    let output = config.capturable.dda_output();
+    let chosen = match (enabled, output) {
+        (true, Some(output)) => Some(output),
+        _ => None,
+    };
+    info!(
+        capturable = %config.capturable.name(),
+        dda_output = ?output,
+        weylus_dda = enabled,
+        "Video path: {}",
+        if chosen.is_some() { "dda_qsv (ddagrab + h264_qsv)" } else { "captrs" }
+    );
+    let output = match chosen {
+        Some(output) => output,
+        None => return false,
+    };
+    let fps = if config.frame_rate.is_finite() && config.frame_rate >= 1.0 {
+        config.frame_rate.round().min(120.0) as u32
+    } else {
+        60
+    };
+    *dda = Some(DdaTarget {
+        output,
+        capture_cursor: config.capture_cursor,
+        fps,
+        failures: 0,
+        frames: 0,
+        rebuild_until: None,
+        next_try: Instant::now(),
+    });
+    // an encoder made for captrs frames is no use here; NewVideo follows with the GPU one
+    *video_encoder = None;
+    true
+}
+
+/// A failure on the GPU path: drop the encoder (ending the duplication), then rebuild or fall back.
+#[cfg(target_os = "windows")]
+fn dda_failed(
+    dda: &mut Option<DdaTarget>,
+    video_encoder: &mut Option<Box<VideoEncoder>>,
+    what: &str,
+) -> DdaTick {
+    *video_encoder = None;
+    let now = Instant::now();
+    let fall_back = {
+        let t = match dda.as_mut() {
+            Some(t) => t,
+            None => return DdaTick::NotUsed,
+        };
+        match t.rebuild_until {
+            Some(until) if now < until => {
+                debug!(output = t.output, "GPU capture {what}; still rebuilding.");
+                t.next_try = now + DDA_RETRY_EVERY;
+                false
+            }
+            _ => {
+                t.failures += 1;
+                if t.failures == 1 {
+                    warn!(
+                        output = t.output,
+                        failures = t.failures,
+                        "GPU capture (ddagrab + h264_qsv) {what}; rebuilding it."
+                    );
+                    t.rebuild_until = Some(now + DDA_REBUILD_PATIENCE);
+                    t.next_try = now;
+                    false
+                } else {
+                    warn!(
+                        output = t.output,
+                        failures = t.failures,
+                        "GPU capture (ddagrab + h264_qsv) {what}; falling back to captrs."
+                    );
+                    true
+                }
+            }
+        }
+    };
+    if fall_back {
+        *dda = None;
+        DdaTick::FallBack
+    } else {
+        DdaTick::Done
+    }
+}
+
+/// One tick of the GPU path (Windows): build the encoder if there is none, then encode a frame.
+#[cfg(target_os = "windows")]
+fn dda_tick<S: WeylusSender + Clone + 'static>(
+    dda: &mut Option<DdaTarget>,
+    video_encoder: &mut Option<Box<VideoEncoder>>,
+    sender: &mut S,
+    max_width: usize,
+    max_height: usize,
+    stats: &mut VideoStats,
+) -> DdaTick {
+    let (output, fps, capture_cursor, next_try) = match dda.as_ref() {
+        Some(t) => (t.output, t.fps, t.capture_cursor, t.next_try),
+        None => return DdaTick::NotUsed,
+    };
+    stats.path = "dda_qsv";
+
+    if video_encoder.is_none() {
+        if Instant::now() < next_try {
+            return DdaTick::Done;
+        }
+        let mut sender_video = sender.clone();
+        let res = VideoEncoder::new_dda(
+            output,
+            max_width,
+            max_height,
+            fps,
+            capture_cursor,
+            move |data| {
+                if let Err(err) = sender_video.send_video(data) {
+                    warn!("Failed to send video frame: {err}!");
+                }
+            },
+        );
+        match res {
+            Ok(encoder) => {
+                if let Some(t) = dda.as_mut() {
+                    if t.rebuild_until.take().is_some() {
+                        info!(output, "GPU capture rebuilt.");
+                    }
+                    t.frames = 0;
+                }
+                // Only now: with delay_moov nothing is written until the first frame, so a failed
+                // build (retried every 250 ms) does not reset the client's player each time.
+                send_message(sender, MessageOutbound::NewVideo);
+                *video_encoder = Some(encoder);
+            }
+            Err(err) => {
+                stats.errors += 1;
+                return dda_failed(dda, video_encoder, &format!("could not start: {err}"));
+            }
+        }
+    }
+
+    let result = {
+        let encoder = video_encoder.as_mut().unwrap();
+        let t_encode = Instant::now();
+        let result = encoder.encode_next();
+        (result, t_encode.elapsed(), encoder.size())
+    };
+    match result {
+        (Ok(Some(capture)), total, size) => {
+            stats.capture += capture;
+            stats.encode += total.saturating_sub(capture);
+            stats.frames += 1;
+            stats.size = size;
+            if let Some(t) = dda.as_mut() {
+                t.frames += 1;
+                if t.frames == DDA_HEALTHY_FRAMES && t.failures > 0 {
+                    info!(output, failures = t.failures, "GPU capture healthy again.");
+                    t.failures = 0;
+                }
+            }
+            DdaTick::Done
+        }
+        (Ok(None), _, _) => {
+            stats.timeouts += 1;
+            DdaTick::Done
+        }
+        (Err(err), _, _) => {
+            stats.errors += 1;
+            dda_failed(dda, video_encoder, &format!("stopped: {err}"))
+        }
     }
 }
 
@@ -372,6 +617,13 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
     let mut last_frame = Instant::now();
     let mut paused = false;
     let mut stats = VideoStats::new();
+
+    // Windows GPU path: the target while it is in use, and the capturable to record with captrs
+    // if it falls back.
+    #[cfg(target_os = "windows")]
+    let mut dda: Option<DdaTarget> = None;
+    #[cfg(target_os = "windows")]
+    let mut dda_fallback: Option<(Box<dyn Capturable>, bool)> = None;
 
     loop {
         stats.maybe_log();
@@ -400,19 +652,31 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     // This shouldn't affect other Recorder trait objects.
                     recorder = None;
                 }
-                match config.capturable.recorder(config.capture_cursor) {
-                    Ok(r) => {
-                        recorder = Some(r);
-                        max_width = config.max_width;
-                        max_height = config.max_height;
-                        send_message(&mut sender, MessageOutbound::ConfigOk);
-                    }
-                    Err(err) => {
-                        warn!("Failed to init screen cast: {}!", err);
-                        send_message(
-                            &mut sender,
-                            MessageOutbound::Error("Failed to init screen cast!".into()),
-                        )
+                // Windows: a whole output goes the GPU path, and then no captrs recorder is made,
+                // so captrs and ddagrab never duplicate the same output at once.
+                #[cfg(target_os = "windows")]
+                let on_gpu = dda_start(&mut dda, &mut video_encoder, &mut dda_fallback, &config);
+                #[cfg(not(target_os = "windows"))]
+                let on_gpu = false;
+                if on_gpu {
+                    max_width = config.max_width;
+                    max_height = config.max_height;
+                    send_message(&mut sender, MessageOutbound::ConfigOk);
+                } else {
+                    match config.capturable.recorder(config.capture_cursor) {
+                        Ok(r) => {
+                            recorder = Some(r);
+                            max_width = config.max_width;
+                            max_height = config.max_height;
+                            send_message(&mut sender, MessageOutbound::ConfigOk);
+                        }
+                        Err(err) => {
+                            warn!("Failed to init screen cast: {}!", err);
+                            send_message(
+                                &mut sender,
+                                MessageOutbound::Error("Failed to init screen cast!".into()),
+                            )
+                        }
                     }
                 }
                 last_frame = Instant::now();
@@ -438,6 +702,31 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                 video_encoder = None;
             }
             Err(RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "windows")]
+                match dda_tick(
+                    &mut dda,
+                    &mut video_encoder,
+                    &mut sender,
+                    max_width,
+                    max_height,
+                    &mut stats,
+                ) {
+                    DdaTick::Done => continue,
+                    DdaTick::FallBack => {
+                        // the GPU encoder, and with it the duplication, is already gone
+                        if let Some((capturable, capture_cursor)) = dda_fallback.as_ref() {
+                            match capturable.recorder(*capture_cursor) {
+                                Ok(r) => {
+                                    info!("Video path: captrs (the GPU path failed twice).");
+                                    recorder = Some(r);
+                                }
+                                Err(err) => warn!("Failed to init screen cast: {}!", err),
+                            }
+                        }
+                        continue;
+                    }
+                    DdaTick::NotUsed => stats.path = "captrs",
+                }
                 if recorder.is_none() {
                     warn!("Screen capture not initalized, can not send video frame!");
                     continue;

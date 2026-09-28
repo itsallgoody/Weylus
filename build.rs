@@ -102,6 +102,10 @@ fn main() {
     if target_os == "windows" {
         cc_video.define("HAS_MEDIAFOUNDATION", None);
     }
+    if has_qsv {
+        // the GPU path in encode_video.c: ddagrab -> scale_qsv -> h264_qsv
+        cc_video.define("HAS_QSV", None);
+    }
     if enable_libnpp {
         cc_video.define("HAS_LIBNPP", None);
     }

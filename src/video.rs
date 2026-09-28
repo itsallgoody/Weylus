@@ -26,6 +26,35 @@ extern "C" {
     fn fill_bgr0(ctx: *mut c_void, data: *const u8, stride: c_int, err: *mut CError);
 }
 
+// The GPU path (lib/encode_video.c, Windows): ddagrab -> scale_qsv -> h264_qsv.
+#[cfg(target_os = "windows")]
+extern "C" {
+    fn init_video_encoder_dda(
+        rust_ctx: *mut c_void,
+        output_idx: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        fps: c_int,
+        draw_mouse: c_int,
+        err: *mut CError,
+    ) -> *mut c_void;
+    fn encode_video_frame_dda(
+        handle: *mut c_void,
+        millis: c_int,
+        got_frame: *mut c_int,
+        capture_us: *mut c_int,
+        err: *mut CError,
+    );
+    fn video_encoder_dda_size(
+        handle: *mut c_void,
+        width_in: *mut c_int,
+        height_in: *mut c_int,
+        width_out: *mut c_int,
+        height_out: *mut c_int,
+    );
+    fn destroy_video_encoder_dda(handle: *mut c_void);
+}
+
 // this is used as callback in lib/encode_video.c via ffmpegs AVIOContext
 #[no_mangle]
 fn write_video_packet(video_encoder: *mut c_void, buf: *const c_uchar, buf_size: c_int) -> c_int {
@@ -72,6 +101,9 @@ pub struct VideoEncoder {
     height_out: usize,
     write_data: Box<dyn FnMut(&[u8])>,
     start_time: Instant,
+    /// handle is a DdaContext (the GPU path), not a VideoContext
+    #[cfg(target_os = "windows")]
+    dda: bool,
 }
 
 impl VideoEncoder {
@@ -91,6 +123,8 @@ impl VideoEncoder {
             height_out,
             write_data: Box::new(move |data| write_data(data)),
             start_time: Instant::now(),
+            #[cfg(target_os = "windows")]
+            dda: false,
         });
         let handle = unsafe {
             init_video_encoder(
@@ -148,6 +182,92 @@ impl VideoEncoder {
         }
     }
 
+    /// The GPU path (Windows): desktop duplication of DXGI output `output_idx` (adapter 0) through
+    /// scale_qsv into h264_qsv, never copied to the CPU. The captured size is whatever that output
+    /// is; the stream is fitted into max_width x max_height by the same rule as the captrs path.
+    #[cfg(target_os = "windows")]
+    pub fn new_dda(
+        output_idx: u32,
+        max_width: usize,
+        max_height: usize,
+        fps: u32,
+        draw_mouse: bool,
+        mut write_data: impl FnMut(&[u8]) + 'static,
+    ) -> Result<Box<Self>, CError> {
+        let mut video_encoder = Box::new(Self {
+            handle: std::ptr::null_mut(),
+            width_in: 0,
+            height_in: 0,
+            width_out: 0,
+            height_out: 0,
+            write_data: Box::new(move |data| write_data(data)),
+            start_time: Instant::now(),
+            dda: true,
+        });
+        let mut err = CError::new();
+        let handle = unsafe {
+            init_video_encoder_dda(
+                video_encoder.as_mut() as *mut _ as *mut c_void,
+                output_idx as c_int,
+                max_width.min(c_int::MAX as usize) as c_int,
+                max_height.min(c_int::MAX as usize) as c_int,
+                fps as c_int,
+                draw_mouse.into(),
+                &mut err,
+            )
+        };
+        if err.is_err() || handle.is_null() {
+            return Err(err);
+        }
+        video_encoder.handle = handle;
+        let (mut wi, mut hi, mut wo, mut ho): (c_int, c_int, c_int, c_int) = (0, 0, 0, 0);
+        unsafe { video_encoder_dda_size(handle, &mut wi, &mut hi, &mut wo, &mut ho) };
+        video_encoder.width_in = wi as usize;
+        video_encoder.height_in = hi as usize;
+        video_encoder.width_out = wo as usize;
+        video_encoder.height_out = ho as usize;
+        Ok(video_encoder)
+    }
+
+    /// GPU path: pull the next desktop frame through the graph and encode it. Ok(Some(t)) when a
+    /// frame went out, t being the time to get it out of the graph (capture + convert + scale);
+    /// Ok(None) when ddagrab had none yet. An error means the duplication or the encoder is gone.
+    #[cfg(target_os = "windows")]
+    pub fn encode_next(&mut self) -> Result<Option<std::time::Duration>, CError> {
+        let mut err = CError::new();
+        let mut got_frame: c_int = 0;
+        let mut capture_us: c_int = 0;
+        unsafe {
+            encode_video_frame_dda(
+                self.handle,
+                (Instant::now() - self.start_time).as_millis() as c_int,
+                &mut got_frame,
+                &mut capture_us,
+                &mut err,
+            );
+        }
+        if err.is_err() {
+            return Err(err);
+        }
+        if got_frame == 0 {
+            return Ok(None);
+        }
+        Ok(Some(std::time::Duration::from_micros(
+            capture_us.max(0) as u64
+        )))
+    }
+
+    /// (width_in, height_in, width_out, height_out)
+    #[cfg(target_os = "windows")]
+    pub fn size(&self) -> (usize, usize, usize, usize) {
+        (
+            self.width_in,
+            self.height_in,
+            self.width_out,
+            self.height_out,
+        )
+    }
+
     pub fn check_size(
         &self,
         width_in: usize,
@@ -164,8 +284,15 @@ impl VideoEncoder {
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { destroy_video_encoder(self.handle) }
+        if self.handle.is_null() {
+            return;
         }
+        // the GPU path's context also ends its desktop duplication here
+        #[cfg(target_os = "windows")]
+        if self.dda {
+            unsafe { destroy_video_encoder_dda(self.handle) }
+            return;
+        }
+        unsafe { destroy_video_encoder(self.handle) }
     }
 }
