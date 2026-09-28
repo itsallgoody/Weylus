@@ -35,13 +35,36 @@ mod weylus;
 /// taps off the shown screen). Needs Windows 10 1703 or later; a failure is logged and Weylus runs as before.
 #[cfg(target_os = "windows")]
 fn set_dpi_awareness() {
-    use winapi::shared::windef::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
-    use winapi::um::winuser::SetProcessDpiAwarenessContext;
-    let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    if ok != 0 {
-        info!("DPI awareness: per-monitor v2 (capture and input in physical pixels on every monitor)");
-    } else {
-        warn!("DPI awareness: could not set per-monitor v2; on a scaled monitor input may land off target");
+    use winapi::shared::windef::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::winuser::{
+        AreDpiAwarenessContextsEqual, GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+        SetProcessDpiAwarenessContext,
+    };
+    unsafe {
+        let ok = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let err = if ok == 0 { GetLastError() } else { 0 };
+        let mut ok_v1 = 0;
+        if ok == 0 {
+            // Windows before 1703 has no v2; per-monitor v1 still gives physical pixels.
+            ok_v1 = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        }
+        let ctx = GetThreadDpiAwarenessContext();
+        // 0 = unaware, 1 = system aware, 2 = per-monitor aware (DPI_AWARENESS).
+        let awareness = GetAwarenessFromDpiAwarenessContext(ctx);
+        let is_v2 = AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
+        if awareness == 2 {
+            info!(
+                "DPI awareness: per-monitor (v2={}, set_v2={}, set_v1={}, error={}): capture and input in physical pixels",
+                is_v2, ok != 0, ok_v1 != 0, err
+            );
+        } else {
+            // error 5 = already set before main (a manifest or a compatibility setting on the exe).
+            warn!(
+                "DPI awareness: NOT per-monitor (awareness={}, set_v2={}, set_v1={}, error={}); on a scaled monitor input may land off target",
+                awareness, ok != 0, ok_v1 != 0, err
+            );
+        }
     }
 }
 
