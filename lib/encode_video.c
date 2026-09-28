@@ -1,4 +1,3 @@
-#include <inttypes.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -623,12 +622,13 @@ void open_video(VideoContext* ctx, Error* err)
 						// Intel's MFT gives no SPS/PPS at open, only in the first frame: an empty_moov
 						// header would carry an empty avcC. delay_moov writes the moov from that frame.
 						ctx->delay_moov = 1;
+						// kbit/s as int: log_info is checked as ms_printf on mingw, which has no %lld
 						log_info(
-							"Video: h264_mf bit_rate=%" PRId64 " max_rate=%" PRId64
-							" buffer=%d profile=main gop=%d b_frames=%d movflags=delay_moov",
-							ctx->c->bit_rate,
-							ctx->c->rc_max_rate,
-							ctx->c->rc_buffer_size,
+							"Video: h264_mf bit_rate_kbps=%d max_rate_kbps=%d buffer_kbit=%d "
+							"profile=main gop=%d b_frames=%d movflags=delay_moov",
+							(int)(ctx->c->bit_rate / 1000),
+							(int)(ctx->c->rc_max_rate / 1000),
+							ctx->c->rc_buffer_size / 1000,
 							ctx->c->gop_size,
 							ctx->c->max_b_frames);
 					}
