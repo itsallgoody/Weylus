@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +74,11 @@ typedef struct VideoContext
 	int try_nvenc;
 	int try_videotoolbox;
 	int try_mediafoundation;
+	// movflags delay_moov: the moov (with a real avcC) is written after the first packet instead of in the header.
+	// Set for encoders that only deliver SPS/PPS inside the first frame (h264_mf on Intel Quick Sync).
+	int delay_moov;
+	// with delay_moov: the first flush after the first packet writes only ftyp+moov, a second one the fragment
+	int moov_flushed;
 } VideoContext;
 
 // this is a rust function and lives in src/video.rs
@@ -595,7 +601,6 @@ void open_video(VideoContext* ctx, Error* err)
 					ctx->c->pix_fmt = AV_PIX_FMT_NV12;
 					av_opt_set(ctx->c->priv_data, "rate_control", "ld_vbr", 0);
 					av_opt_set(ctx->c->priv_data, "scenario", "display_remoting", 0);
-					av_opt_set(ctx->c->priv_data, "quality", "100", 0);
 					// Ask for the hardware (asynchronous) MFTs: without it ffmpeg only lists the synchronous
 					// ones, which is Microsoft's software "H264 Encoder MFT", never Intel Quick Sync.
 					av_opt_set(ctx->c->priv_data, "hw_encoding", "1", 0);
@@ -603,9 +608,30 @@ void open_video(VideoContext* ctx, Error* err)
 					// A real frame rate: with 0/1 mfenc falls back to 1/time_base = 1000 fps, which no
 					// H.264 level allows ("could not set output type (80004005)").
 					ctx->c->framerate = (AVRational){60, 1};
+					// Without these mfenc passes libavcodec's defaults: 200 kbit/s (the log showed
+					// MF_MT_AVG_BITRATE=200000), Baseline, and set_codec_params' gop of 12. That was the grain.
+					ctx->c->bit_rate = 12000000;
+					ctx->c->rc_max_rate = 20000000;
+					ctx->c->rc_buffer_size = 2000000;
+					ctx->c->profile = AV_PROFILE_H264_MAIN;
+					ctx->c->gop_size = 60;
+					ctx->c->max_b_frames = 0;
 					int ret = avcodec_open2(ctx->c, codec, NULL);
 					if (ret == 0)
+					{
 						using_hw = 1;
+						// Intel's MFT gives no SPS/PPS at open, only in the first frame: an empty_moov
+						// header would carry an empty avcC. delay_moov writes the moov from that frame.
+						ctx->delay_moov = 1;
+						log_info(
+							"Video: h264_mf bit_rate=%" PRId64 " max_rate=%" PRId64
+							" buffer=%d profile=main gop=%d b_frames=%d movflags=delay_moov",
+							ctx->c->bit_rate,
+							ctx->c->rc_max_rate,
+							ctx->c->rc_buffer_size,
+							ctx->c->gop_size,
+							ctx->c->max_b_frames);
+					}
 					else
 					{
 						log_debug("Could not open codec: %s!", av_err2str(ret));
@@ -791,7 +817,17 @@ void open_video(VideoContext* ctx, Error* err)
 	AVDictionary* opt = NULL;
 
 	// enable writing fragmented mp4
-	av_dict_set(&opt, "movflags", "frag_custom+empty_moov+default_base_moof", 0);
+	if (ctx->delay_moov)
+	{
+		// delay_moov implies empty_moov in movenc (packets go to per-fragment buffers) but writes
+		// ftyp+moov at the first flush, after the first packet, so the avcC is built from that frame.
+		av_dict_set(&opt, "movflags", "frag_custom+delay_moov+default_base_moof", 0);
+		// empty_moov without delay_moov turns the edit list off (movenc.c mov_init); keep that, so the
+		// timestamps stay shifted to zero exactly as before.
+		av_dict_set(&opt, "use_editlist", "0", 0);
+	}
+	else
+		av_dict_set(&opt, "movflags", "frag_custom+empty_moov+default_base_moof", 0);
 	ret = avformat_write_header(ctx->oc, &opt);
 	if (ret < 0)
 		log_warn("Video: failed to write header!");
@@ -867,6 +903,13 @@ void encode_video_frame(VideoContext* ctx, int millis, Error* err)
 
 		// new fragment on every frame for lowest latency
 		av_write_frame(ctx->oc, NULL);
+		if (ctx->delay_moov && !ctx->moov_flushed)
+		{
+			// with delay_moov the first flush returns right after writing ftyp+moov
+			// (movenc.c mov_flush_fragment); this one writes the first frame's moof+mdat
+			av_write_frame(ctx->oc, NULL);
+			ctx->moov_flushed = 1;
+		}
 	}
 }
 
@@ -894,6 +937,8 @@ VideoContext* init_video_encoder(
 	ctx->try_nvenc = try_nvenc;
 	ctx->try_videotoolbox = try_videotoolbox;
 	ctx->try_mediafoundation = try_mediafoundation;
+	ctx->delay_moov = 0;
+	ctx->moov_flushed = 0;
 	ctx->hw_device_ctx = NULL;
 
 	// make sure all scalers are zero initialized so that destroy can always be called
