@@ -596,7 +596,13 @@ void open_video(VideoContext* ctx, Error* err)
 					av_opt_set(ctx->c->priv_data, "rate_control", "ld_vbr", 0);
 					av_opt_set(ctx->c->priv_data, "scenario", "display_remoting", 0);
 					av_opt_set(ctx->c->priv_data, "quality", "100", 0);
+					// Ask for the hardware (asynchronous) MFTs: without it ffmpeg only lists the synchronous
+					// ones, which is Microsoft's software "H264 Encoder MFT", never Intel Quick Sync.
+					av_opt_set(ctx->c->priv_data, "hw_encoding", "1", 0);
 					set_codec_params(ctx);
+					// A real frame rate: with 0/1 mfenc falls back to 1/time_base = 1000 fps, which no
+					// H.264 level allows ("could not set output type (80004005)").
+					ctx->c->framerate = (AVRational){60, 1};
 					int ret = avcodec_open2(ctx->c, codec, NULL);
 					if (ret == 0)
 						using_hw = 1;

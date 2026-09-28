@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::{spawn, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::channel;
-use tracing::{error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::capturable::{get_capturables, Capturable, Recorder};
 use crate::input::device::{InputDevice, InputDeviceType};
@@ -300,6 +300,62 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
     }
 }
 
+/// Every 5 s while frames flow: how many were sent, where the time went and the sizes, so a slow stream can be
+/// told apart as capture, encode or pacing from the log alone.
+struct VideoStats {
+    since: Instant,
+    frames: u32,
+    timeouts: u32,
+    errors: u32,
+    capture: Duration,
+    encode: Duration,
+    size: (usize, usize, usize, usize),
+}
+
+impl VideoStats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            timeouts: 0,
+            errors: 0,
+            capture: Duration::ZERO,
+            encode: Duration::ZERO,
+            size: (0, 0, 0, 0),
+        }
+    }
+
+    fn maybe_log(&mut self) {
+        let secs = self.since.elapsed().as_secs_f64();
+        if secs < 5.0 {
+            return;
+        }
+        if self.frames + self.timeouts + self.errors > 0 {
+            let per = |d: Duration| {
+                if self.frames == 0 {
+                    0.0
+                } else {
+                    d.as_secs_f64() * 1000.0 / self.frames as f64
+                }
+            };
+            let (wi, hi, wo, ho) = self.size;
+            info!(
+                "Video stats: fps={:.1} capture_ms={:.1} encode_ms={:.1} timeouts={} errors={} size={}x{}->{}x{}",
+                self.frames as f64 / secs,
+                per(self.capture),
+                per(self.encode),
+                self.timeouts,
+                self.errors,
+                wi,
+                hi,
+                wo,
+                ho
+            );
+        }
+        *self = Self::new();
+    }
+}
+
 fn handle_video<S: WeylusSender + Clone + 'static>(
     receiver: mpsc::Receiver<VideoCommands>,
     mut sender: S,
@@ -315,8 +371,10 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
     let mut frame_duration = EFFECTIVE_INIFINITY;
     let mut last_frame = Instant::now();
     let mut paused = false;
+    let mut stats = VideoStats::new();
 
     loop {
+        stats.maybe_log();
         let now = Instant::now();
         let elapsed = now - last_frame;
         let frames_passed = (elapsed.as_secs_f64() / frame_duration.as_secs_f64()) as u32;
@@ -384,11 +442,21 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     warn!("Screen capture not initalized, can not send video frame!");
                     continue;
                 }
+                let t_capture = Instant::now();
                 let pixel_data = recorder.as_mut().unwrap().capture();
                 if let Err(err) = pixel_data {
-                    warn!("Error capturing screen: {}", err);
+                    let err = err.to_string();
+                    // A timeout only means nothing on screen changed; count it, don't shout it.
+                    if err.contains("Timeout") {
+                        stats.timeouts += 1;
+                        debug!("Error capturing screen: {}", err);
+                    } else {
+                        stats.errors += 1;
+                        warn!("Error capturing screen: {}", err);
+                    }
                     continue;
                 }
+                stats.capture += t_capture.elapsed();
                 let pixel_data = pixel_data.unwrap();
                 let (width_in, height_in) = pixel_data.size();
                 let scale =
@@ -432,7 +500,11 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     };
                 }
                 let video_encoder = video_encoder.as_mut().unwrap();
+                let t_encode = Instant::now();
                 video_encoder.encode(pixel_data);
+                stats.encode += t_encode.elapsed();
+                stats.frames += 1;
+                stats.size = (width_in, height_in, width_out, height_out);
             }
             // stop thread once the channel is closed
             Err(RecvTimeoutError::Disconnected) => return,
