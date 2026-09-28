@@ -29,10 +29,30 @@ mod web;
 mod websocket;
 mod weylus;
 
+/// Per-monitor DPI awareness (v2) on Windows. Without it Weylus is DPI-unaware: on a monitor scaled above
+/// 100% Windows virtualizes the coordinates it sees and takes, while DXGI captures physical pixels, so a pointer
+/// sent to the captured picture lands in the wrong place (a 2560x1440 monitor at 150% next to one at 100% put
+/// taps off the shown screen). Needs Windows 10 1703 or later; a failure is logged and Weylus runs as before.
+#[cfg(target_os = "windows")]
+fn set_dpi_awareness() {
+    use winapi::shared::windef::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
+    use winapi::um::winuser::SetProcessDpiAwarenessContext;
+    let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if ok != 0 {
+        info!("DPI awareness: per-monitor v2 (capture and input in physical pixels on every monitor)");
+    } else {
+        warn!("DPI awareness: could not set per-monitor v2; on a scaled monitor input may land off target");
+    }
+}
+
 fn main() {
     let (sender, receiver) = mpsc::sync_channel::<String>(100);
 
     log::setup_logging(sender);
+
+    // Before any capture or input call: on Windows, work in physical pixels on every monitor.
+    #[cfg(target_os = "windows")]
+    set_dpi_awareness();
 
     let conf = get_config();
 
