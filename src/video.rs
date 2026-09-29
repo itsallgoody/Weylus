@@ -104,6 +104,11 @@ pub struct VideoEncoder {
     /// handle is a DdaContext (the GPU path), not a VideoContext
     #[cfg(target_os = "windows")]
     dda: bool,
+    /// the GPU path's hold on its output; a field, so it is dropped after Drop::drop has ended
+    /// the duplication, never before (held only for its Drop)
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    dda_claim: Option<crate::dda_registry::DdaClaim>,
 }
 
 impl VideoEncoder {
@@ -125,6 +130,8 @@ impl VideoEncoder {
             start_time: Instant::now(),
             #[cfg(target_os = "windows")]
             dda: false,
+            #[cfg(target_os = "windows")]
+            dda_claim: None,
         });
         let handle = unsafe {
             init_video_encoder(
@@ -192,6 +199,7 @@ impl VideoEncoder {
         max_height: usize,
         fps: u32,
         draw_mouse: bool,
+        claim: crate::dda_registry::DdaClaim,
         mut write_data: impl FnMut(&[u8]) + 'static,
     ) -> Result<Box<Self>, CError> {
         let mut video_encoder = Box::new(Self {
@@ -203,6 +211,7 @@ impl VideoEncoder {
             write_data: Box::new(move |data| write_data(data)),
             start_time: Instant::now(),
             dda: true,
+            dda_claim: Some(claim),
         });
         let mut err = CError::new();
         let handle = unsafe {

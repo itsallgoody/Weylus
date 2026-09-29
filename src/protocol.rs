@@ -193,18 +193,23 @@ pub trait WeylusSender {
     fn send_message(&mut self, message: MessageOutbound) -> Result<(), Self::Error>;
     fn send_video(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
 
+    // The next three are used by the Windows video loop only (backpressure, dead clients).
+
     /// Video messages handed to the transport and not yet written to the client (0 if unknown).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn video_backlog(&self) -> usize {
         0
     }
 
     /// The largest video message since the last call, in bytes (0 if unknown).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn take_video_max_bytes(&self) -> usize {
         0
     }
 
     /// End this client's session: the transport stops reading and writing, so the handler and
     /// its video thread end. Nothing happens where the transport cannot.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn end_session(&self) {}
 }
 

@@ -20,6 +20,8 @@ use config::{get_config, Config};
 mod capturable;
 mod cerror;
 mod config;
+#[cfg(target_os = "windows")]
+mod dda_registry;
 mod gui;
 mod input;
 mod keep_awake;

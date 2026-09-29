@@ -68,6 +68,18 @@ a session open for minutes): the log says `Client took no video for ... s; endin
 session`, the encoder and its desktop duplication are dropped, and the connection is
 closed, so the tablet's reconnect gets the monitor.
 
+## Latest client wins (one duplication per monitor)
+
+Windows allows one desktop duplication per monitor per process. When a tablet connects to a
+monitor another session still holds (a stuck or half-dead old connection, or a second
+tablet), the new session tells the old one to let go and waits up to 2 s for it. The old
+session drops its encoder (ending the duplication) and stops sending video; it gets the
+monitor back only if its tablet sends a new configuration. Both sides log a line starting
+`dda takeover output=N from=<old session> to=<new session>`: the new side with `waited_ms=`
+and `released=`, the old side with `released_ms=` and `video stopped for this client`. Each
+video thread logs `Video thread started.` with its session number. A session's hold on its
+monitor ends with its encoder, however the session ends.
+
 ## Known limits
 
 - The lock screen, a UAC prompt, Ctrl+Alt+Del, or a resolution, scaling or rotation change
@@ -78,8 +90,9 @@ closed, so the tablet's reconnect gets the monitor.
 - Intel graphics only (Quick Sync), and only the monitors on adapter 0. On a PC without it
   the path fails to start, retries for 4 s at each connect, then uses captrs; set
   `WEYLUS_DDA=0` there to skip the wait.
-- Windows allows one desktop duplication per monitor per process, so two tablets on the
-  same monitor at once do not work (captrs had the same limit).
+- Two tablets on the same monitor take it from each other (the last one to connect or
+  reconfigure wins). A session that fell back to captrs is not in the takeover registry, so
+  a new tablet cannot take a monitor from it.
 - The mouse pointer is drawn when the client asks for "capture cursor" (captrs never drew it).
 - Rate control is ICQ (constant quality) at 23, Harley's pick in a blind clip test (about
   5 Mbit/s on the test clip). It has no peak-rate cap: FFmpeg 8.0's h264_qsv picks ICQ only

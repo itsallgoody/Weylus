@@ -2,6 +2,8 @@ use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, WebSocket, WebSocketE
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
@@ -416,6 +418,12 @@ const DDA_RETRY_EVERY: Duration = Duration::from_millis(250);
 /// Frames after a (re)build that count as healthy: the next failure gets its own rebuild.
 #[cfg(target_os = "windows")]
 const DDA_HEALTHY_FRAMES: u64 = 300;
+/// Latest client wins: how long a session waits for the one holding its output to let go.
+#[cfg(target_os = "windows")]
+const DDA_TAKEOVER_WAIT: Duration = Duration::from_secs(2);
+/// While paused the video thread still wakes this often, so a takeover is not kept waiting.
+#[cfg(target_os = "windows")]
+const PAUSED_POLL: Duration = Duration::from_millis(100);
 /// Backpressure (Windows): a tick is skipped, not encoded, while this many video messages wait
 /// for the client. Skipping keeps H.264 valid: the next frame encoded references the last one
 /// sent, where dropping an encoded frame would break every frame after it.
@@ -440,6 +448,8 @@ struct DdaTarget {
     rebuild_until: Option<Instant>,
     /// no build attempt before this
     next_try: Instant,
+    /// another session took the output (latest client wins): no capture until a new Start
+    superseded: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -496,10 +506,36 @@ fn dda_start(
         frames: 0,
         rebuild_until: None,
         next_try: Instant::now(),
+        superseded: false,
     });
     // an encoder made for captrs frames is no use here; NewVideo follows with the GPU one
     *video_encoder = None;
     true
+}
+
+/// Another session took this session's output (latest client wins, see dda_registry): drop the GPU
+/// encoder, which ends the duplication and then frees the claim, and capture nothing until this
+/// client sends a new configuration (which would take the output back).
+#[cfg(target_os = "windows")]
+fn dda_superseded(
+    dda: &mut Option<DdaTarget>,
+    video_encoder: &mut Option<Box<VideoEncoder>>,
+    session: u64,
+    by: u64,
+) {
+    match dda.as_mut() {
+        Some(t) if !t.superseded => {
+            let t_release = Instant::now();
+            *video_encoder = None;
+            t.superseded = true;
+            info!(
+                "dda takeover output={} from={session} to={by} released_ms={}: video stopped for this client",
+                t.output,
+                t_release.elapsed().as_millis()
+            );
+        }
+        _ => debug!(session, by, "dda takeover flag set, but this session holds no GPU capture"),
+    }
 }
 
 /// A failure on the GPU path: drop the encoder (ending the duplication), then rebuild or fall back.
@@ -554,6 +590,7 @@ fn dda_failed(
 
 /// One tick of the GPU path (Windows): build the encoder if there is none, then encode a frame.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn dda_tick<S: WeylusSender + Clone + 'static>(
     dda: &mut Option<DdaTarget>,
     video_encoder: &mut Option<Box<VideoEncoder>>,
@@ -561,16 +598,31 @@ fn dda_tick<S: WeylusSender + Clone + 'static>(
     max_width: usize,
     max_height: usize,
     stats: &mut VideoStats,
+    session: u64,
+    taken_by: &Arc<AtomicU64>,
 ) -> DdaTick {
-    let (output, fps, capture_cursor, next_try) = match dda.as_ref() {
-        Some(t) => (t.output, t.fps, t.capture_cursor, t.next_try),
+    let (output, fps, capture_cursor, next_try, superseded) = match dda.as_ref() {
+        Some(t) => (t.output, t.fps, t.capture_cursor, t.next_try, t.superseded),
         None => return DdaTick::NotUsed,
     };
+    if superseded {
+        return DdaTick::Done;
+    }
     stats.path = "dda_qsv";
 
     if video_encoder.is_none() {
         if Instant::now() < next_try {
             return DdaTick::Done;
+        }
+        // latest client wins: if another session holds this output, it is told to let go first
+        let (claim, takeover) =
+            crate::dda_registry::claim(output, session, taken_by, DDA_TAKEOVER_WAIT);
+        if let Some(from) = takeover.from {
+            info!(
+                "dda takeover output={output} from={from} to={session} waited_ms={} released={}",
+                takeover.waited.as_millis(),
+                takeover.released
+            );
         }
         let mut sender_video = sender.clone();
         let res = VideoEncoder::new_dda(
@@ -579,6 +631,7 @@ fn dda_tick<S: WeylusSender + Clone + 'static>(
             max_height,
             fps,
             capture_cursor,
+            claim,
             move |data| {
                 if let Err(err) = sender_video.send_video(data) {
                     warn!("Failed to send video frame: {err}!");
@@ -660,15 +713,31 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
     let mut dda: Option<DdaTarget> = None;
     #[cfg(target_os = "windows")]
     let mut dda_fallback: Option<(Box<dyn Capturable>, bool)> = None;
+    // Windows, latest client wins: this session's id, and the flag another session sets (to its own
+    // id) when it wants this session's output
+    #[cfg(target_os = "windows")]
+    let session = crate::dda_registry::new_session_id();
+    #[cfg(target_os = "windows")]
+    let dda_taken_by = Arc::new(AtomicU64::new(0));
     // Windows backpressure: since when the client's backlog has been full, and whether the client
     // was given up as dead (its session is ending)
     #[cfg(target_os = "windows")]
     let mut backlog_full_since: Option<Instant> = None;
     #[cfg(target_os = "windows")]
     let mut client_dead = false;
+    #[cfg(target_os = "windows")]
+    info!(session, "Video thread started.");
 
     loop {
         stats.maybe_log();
+        // checked every pass, commands included, so a takeover never waits on a tick
+        #[cfg(target_os = "windows")]
+        {
+            let by = dda_taken_by.swap(0, Ordering::SeqCst);
+            if by != 0 {
+                dda_superseded(&mut dda, &mut video_encoder, session, by);
+            }
+        }
         let now = Instant::now();
         let elapsed = now - last_frame;
         let frames_passed = (elapsed.as_secs_f64() / frame_duration.as_secs_f64()) as u32;
@@ -680,7 +749,12 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
             trace!("Dropped {frames_passed} frame(s)!");
         }
 
-        match receiver.recv_timeout(if paused { EFFECTIVE_INIFINITY } else { timeout }) {
+        // Windows: a paused session still wakes up, to let go of its output if another takes it
+        #[cfg(target_os = "windows")]
+        let wait = if paused { PAUSED_POLL } else { timeout };
+        #[cfg(not(target_os = "windows"))]
+        let wait = if paused { EFFECTIVE_INIFINITY } else { timeout };
+        match receiver.recv_timeout(wait) {
             Ok(VideoCommands::Start(config)) => {
                 #[allow(unused_assignments)]
                 {
@@ -746,7 +820,7 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
             Err(RecvTimeoutError::Timeout) => {
                 #[cfg(target_os = "windows")]
                 {
-                    if client_dead {
+                    if paused || client_dead {
                         continue;
                     }
                     // Backpressure: never make a frame the client has no room for.
@@ -758,12 +832,13 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                         let since = *backlog_full_since.get_or_insert_with(Instant::now);
                         if since.elapsed() > CLIENT_DEAD_AFTER {
                             warn!(
+                                session,
                                 backlog,
                                 "Client took no video for {:.1} s; ending its session so the output is released.",
                                 since.elapsed().as_secs_f64()
                             );
                             client_dead = true;
-                            // the encoder first: it holds the desktop duplication
+                            // the encoder first: it holds the desktop duplication and the claim
                             video_encoder = None;
                             recorder = None;
                             dda = None;
@@ -781,6 +856,8 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     max_width,
                     max_height,
                     &mut stats,
+                    session,
+                    &dda_taken_by,
                 ) {
                     DdaTick::Done => continue,
                     DdaTick::FallBack => {
@@ -904,7 +981,8 @@ pub struct WsWeylusSender {
     video_queued: Arc<AtomicUsize>,
     /// the largest video message since take_video_max_bytes last ran
     video_max_bytes: Arc<AtomicUsize>,
-    /// closed to end this session: the reader and writer tasks stop at once
+    /// closed to end this session: the reader and writer tasks stop at once (Windows only closes it)
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     session_end: Arc<tokio::sync::Semaphore>,
 }
 
