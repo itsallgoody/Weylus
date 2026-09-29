@@ -42,14 +42,31 @@ Run Weylus with its log visible, connect the tablet, pick the 4K monitor.
 2. When the encoder opens:
    `Video: dda+qsv output=0 3840x2160->2304x1296@h264_qsv fps=60 ddagrab_rate=120 ... rc=icq global_quality=23 ...`
 3. Every 5 s while frames flow:
-   `Video stats: fps=... capture_ms=... encode_ms=... timeouts=... errors=... size=3840x2160->2304x1296 path=dda_qsv`
+   `Video stats: fps=... capture_ms=... encode_ms=... timeouts=... errors=... size=3840x2160->2304x1296 path=dda_qsv backlog_max=... skipped_ticks=... max_frame_kb=...`
    - `fps` should sit near the client's frame rate (the goal: 55+ at 60).
+   - `backlog_max` is the most video messages that were waiting for the tablet at a tick, and
+     `skipped_ticks` the ticks not captured because two were already waiting (see
+     Backpressure). On a good link both stay at 0-1 and 0.
+   - `max_frame_kb` is the largest frame sent in those 5 s (keyframes and 4K scrolls).
    - `capture_ms` is the time to get a frame out of the graph (duplication, conversion,
      scaling). On a still screen it includes up to a quarter frame of waiting for a new one.
    - `encode_ms` is h264_qsv plus muxing.
 4. Cores: in PowerShell, `$a=(Get-Process weylus).CPU; Start-Sleep 10; ((Get-Process weylus).CPU-$a)/10`
    prints the cores Weylus used over those 10 s. The goal is well under one core (0.34 was
    measured for ffmpeg alone). Compare with a run under `WEYLUS_DDA=0`.
+
+## Backpressure
+
+The server makes a frame only when the tablet has room for it. While two or more video
+messages are still waiting to be written to the tablet, a tick is skipped rather than
+encoded: the stream stays valid (the next frame references the last one sent), and the
+tablet gets the newest picture as soon as it catches up instead of a growing queue of old
+ones. The video thread never waits on a full queue.
+
+If the queue stays full for more than 3 s the tablet is taken as gone (a dead link can keep
+a session open for minutes): the log says `Client took no video for ... s; ending its
+session`, the encoder and its desktop duplication are dropped, and the connection is
+closed, so the tablet's reconnect gets the monitor.
 
 ## Known limits
 

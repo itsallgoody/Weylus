@@ -2,11 +2,13 @@ use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, WebSocket, WebSocketE
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
 use std::thread::{spawn, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::capturable::{get_capturables, Capturable, Recorder};
@@ -313,6 +315,15 @@ struct VideoStats {
     /// Windows: "dda_qsv" (the GPU path) or "captrs"
     #[cfg(target_os = "windows")]
     path: &'static str,
+    /// Windows backpressure: the most video messages waiting for the client at a tick
+    #[cfg(target_os = "windows")]
+    backlog_max: usize,
+    /// Windows backpressure: ticks not captured because the client had not taken the last frames
+    #[cfg(target_os = "windows")]
+    skipped_ticks: u32,
+    /// the largest video message sent
+    #[cfg(target_os = "windows")]
+    max_frame_bytes: usize,
 }
 
 impl VideoStats {
@@ -327,6 +338,12 @@ impl VideoStats {
             size: (0, 0, 0, 0),
             #[cfg(target_os = "windows")]
             path: "captrs",
+            #[cfg(target_os = "windows")]
+            backlog_max: 0,
+            #[cfg(target_os = "windows")]
+            skipped_ticks: 0,
+            #[cfg(target_os = "windows")]
+            max_frame_bytes: 0,
         }
     }
 
@@ -335,7 +352,11 @@ impl VideoStats {
         if secs < 5.0 {
             return;
         }
-        if self.frames + self.timeouts + self.errors > 0 {
+        #[cfg(target_os = "windows")]
+        let active = self.frames + self.timeouts + self.errors + self.skipped_ticks > 0;
+        #[cfg(not(target_os = "windows"))]
+        let active = self.frames + self.timeouts + self.errors > 0;
+        if active {
             let per = |d: Duration| {
                 if self.frames == 0 {
                     0.0
@@ -345,7 +366,13 @@ impl VideoStats {
             };
             let (wi, hi, wo, ho) = self.size;
             #[cfg(target_os = "windows")]
-            let path = format!(" path={}", self.path);
+            let path = format!(
+                " path={} backlog_max={} skipped_ticks={} max_frame_kb={}",
+                self.path,
+                self.backlog_max,
+                self.skipped_ticks,
+                self.max_frame_bytes.div_ceil(1024)
+            );
             #[cfg(not(target_os = "windows"))]
             let path = "";
             info!(
@@ -389,6 +416,15 @@ const DDA_RETRY_EVERY: Duration = Duration::from_millis(250);
 /// Frames after a (re)build that count as healthy: the next failure gets its own rebuild.
 #[cfg(target_os = "windows")]
 const DDA_HEALTHY_FRAMES: u64 = 300;
+/// Backpressure (Windows): a tick is skipped, not encoded, while this many video messages wait
+/// for the client. Skipping keeps H.264 valid: the next frame encoded references the last one
+/// sent, where dropping an encoded frame would break every frame after it.
+#[cfg(target_os = "windows")]
+const VIDEO_BACKLOG_SKIP: usize = 2;
+/// Backpressure (Windows): a client whose backlog stays full this long is dead; the session ends
+/// so its output (and desktop duplication) is released.
+#[cfg(target_os = "windows")]
+const CLIENT_DEAD_AFTER: Duration = Duration::from_secs(3);
 
 /// The GPU path's state for the capturable chosen by the last Start (Windows).
 #[cfg(target_os = "windows")]
@@ -624,6 +660,12 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
     let mut dda: Option<DdaTarget> = None;
     #[cfg(target_os = "windows")]
     let mut dda_fallback: Option<(Box<dyn Capturable>, bool)> = None;
+    // Windows backpressure: since when the client's backlog has been full, and whether the client
+    // was given up as dead (its session is ending)
+    #[cfg(target_os = "windows")]
+    let mut backlog_full_since: Option<Instant> = None;
+    #[cfg(target_os = "windows")]
+    let mut client_dead = false;
 
     loop {
         stats.maybe_log();
@@ -702,6 +744,35 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                 video_encoder = None;
             }
             Err(RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "windows")]
+                {
+                    if client_dead {
+                        continue;
+                    }
+                    // Backpressure: never make a frame the client has no room for.
+                    stats.max_frame_bytes = stats.max_frame_bytes.max(sender.take_video_max_bytes());
+                    let backlog = sender.video_backlog();
+                    stats.backlog_max = stats.backlog_max.max(backlog);
+                    if backlog >= VIDEO_BACKLOG_SKIP {
+                        stats.skipped_ticks += 1;
+                        let since = *backlog_full_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() > CLIENT_DEAD_AFTER {
+                            warn!(
+                                backlog,
+                                "Client took no video for {:.1} s; ending its session so the output is released.",
+                                since.elapsed().as_secs_f64()
+                            );
+                            client_dead = true;
+                            // the encoder first: it holds the desktop duplication
+                            video_encoder = None;
+                            recorder = None;
+                            dda = None;
+                            sender.end_session();
+                        }
+                        continue;
+                    }
+                    backlog_full_since = None;
+                }
                 #[cfg(target_os = "windows")]
                 match dda_tick(
                     &mut dda,
@@ -828,18 +899,53 @@ unsafe impl Send for WsMessage {}
 #[derive(Clone)]
 pub struct WsWeylusSender {
     sender: tokio::sync::mpsc::Sender<WsMessage>,
+    /// video messages in the channel or being written: +1 in send_video, -1 once the writer task
+    /// has written it (the backpressure signal the video thread reads)
+    video_queued: Arc<AtomicUsize>,
+    /// the largest video message since take_video_max_bytes last ran
+    video_max_bytes: Arc<AtomicUsize>,
+    /// closed to end this session: the reader and writer tasks stop at once
+    session_end: Arc<tokio::sync::Semaphore>,
 }
 
 impl WeylusSender for WsWeylusSender {
-    type Error = tokio::sync::mpsc::error::SendError<WsMessage>;
+    type Error = TrySendError<WsMessage>;
 
     fn send_message(&mut self, message: MessageOutbound) -> Result<(), Self::Error> {
         self.sender
             .blocking_send(WsMessage::MessageOutbound(message))
+            .map_err(TrySendError::from)
     }
 
     fn send_video(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.sender.blocking_send(WsMessage::Video(bytes.to_vec()))
+        self.video_max_bytes.fetch_max(bytes.len(), Ordering::Relaxed);
+        self.video_queued.fetch_add(1, Ordering::SeqCst);
+        // Windows: never block the video thread on a full channel. handle_video skips ticks while two
+        // messages wait, so the channel (32) only fills if the writer is stuck; the frame is then
+        // dropped and the stream heals at the next keyframe.
+        #[cfg(target_os = "windows")]
+        let res = self.sender.try_send(WsMessage::Video(bytes.to_vec()));
+        #[cfg(not(target_os = "windows"))]
+        let res = self
+            .sender
+            .blocking_send(WsMessage::Video(bytes.to_vec()))
+            .map_err(TrySendError::from);
+        if res.is_err() {
+            self.video_queued.fetch_sub(1, Ordering::SeqCst);
+        }
+        res
+    }
+
+    fn video_backlog(&self) -> usize {
+        self.video_queued.load(Ordering::SeqCst)
+    }
+
+    fn take_video_max_bytes(&self) -> usize {
+        self.video_max_bytes.swap(0, Ordering::Relaxed)
+    }
+
+    fn end_session(&self) {
+        self.session_end.close();
     }
 }
 
@@ -853,9 +959,13 @@ pub fn weylus_websocket_channel(
 
     let (sender_inbound, receiver_inbound) = channel::<MessageInbound>(32);
     let (sender_outbound, mut receiver_outbound) = channel::<WsMessage>(32);
+    let video_queued = Arc::new(AtomicUsize::new(0));
+    // WsWeylusSender::end_session closes it; both tasks below stop, which closes the connection
+    let session_end = Arc::new(tokio::sync::Semaphore::new(0));
 
     {
         let sender_outbound = sender_outbound.clone();
+        let session_end = session_end.clone();
         tokio::spawn(async move {
             let mut send_fn = |frame| async {
                 if let Err(err) = sender_outbound.send(WsMessage::Frame(frame)).await {
@@ -869,6 +979,7 @@ pub fn weylus_websocket_channel(
 
                 let frame = tokio::select! {
                     _ = semaphore_shutdown.acquire() => break,
+                    _ = session_end.acquire() => break,
                     frame = fut => match frame {
                         Ok(frame) => frame,
                         Err(err) => {
@@ -893,48 +1004,73 @@ pub fn weylus_websocket_channel(
         });
     }
 
-    tokio::spawn(async move {
-        loop {
-            let msg = if let Some(msg) = receiver_outbound.recv().await {
-                msg
-            } else {
-                break;
-            };
+    {
+        let video_queued = video_queued.clone();
+        let session_end = session_end.clone();
+        tokio::spawn(async move {
+            loop {
+                // every await here also watches session_end: a write to a dead client can wait for
+                // minutes, and the session has to end now
+                let msg = tokio::select! {
+                    _ = session_end.acquire() => break,
+                    msg = receiver_outbound.recv() => match msg {
+                        Some(msg) => msg,
+                        None => break,
+                    },
+                };
 
-            match msg {
-                WsMessage::Frame(frame) => {
-                    if let Err(err) = tx.write_frame(frame).await {
-                        if let WebSocketError::ConnectionClosed = err {
-                            break;
+                match msg {
+                    WsMessage::Frame(frame) => {
+                        let res = tokio::select! {
+                            _ = session_end.acquire() => break,
+                            res = tx.write_frame(frame) => res,
+                        };
+                        if let Err(err) = res {
+                            if let WebSocketError::ConnectionClosed = err {
+                                break;
+                            }
+                            warn!("Failed to send frame: {err}");
                         }
-                        warn!("Failed to send frame: {err}");
                     }
-                }
-                WsMessage::Video(data) => {
-                    if let Err(err) = tx.write_frame(Frame::binary(data.into())).await {
-                        if let WebSocketError::ConnectionClosed = err {
-                            break;
+                    WsMessage::Video(data) => {
+                        let res = tokio::select! {
+                            _ = session_end.acquire() => break,
+                            res = tx.write_frame(Frame::binary(data.into())) => res,
+                        };
+                        // written (or failed): no longer backlog
+                        video_queued.fetch_sub(1, Ordering::SeqCst);
+                        if let Err(err) = res {
+                            if let WebSocketError::ConnectionClosed = err {
+                                break;
+                            }
+                            warn!("Failed to send video frame: {err}");
                         }
-                        warn!("Failed to send video frame: {err}");
                     }
-                }
-                WsMessage::MessageOutbound(msg) => {
-                    let json_string = serde_json::to_string(&msg).unwrap();
-                    let data = json_string.as_bytes();
-                    if let Err(err) = tx.write_frame(Frame::text(data.into())).await {
-                        if let WebSocketError::ConnectionClosed = err {
-                            break;
+                    WsMessage::MessageOutbound(msg) => {
+                        let json_string = serde_json::to_string(&msg).unwrap();
+                        let data = json_string.as_bytes();
+                        let res = tokio::select! {
+                            _ = session_end.acquire() => break,
+                            res = tx.write_frame(Frame::text(data.into())) => res,
+                        };
+                        if let Err(err) = res {
+                            if let WebSocketError::ConnectionClosed = err {
+                                break;
+                            }
+                            warn!("Failed to send outbound message: {err}");
                         }
-                        warn!("Failed to send outbound message: {err}");
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     (
         WsWeylusSender {
             sender: sender_outbound,
+            video_queued,
+            video_max_bytes: Arc::new(AtomicUsize::new(0)),
+            session_end,
         },
         WsWeylusReceiver {
             recv: receiver_inbound,

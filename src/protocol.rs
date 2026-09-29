@@ -192,6 +192,20 @@ pub trait WeylusSender {
     type Error: std::error::Error;
     fn send_message(&mut self, message: MessageOutbound) -> Result<(), Self::Error>;
     fn send_video(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+
+    /// Video messages handed to the transport and not yet written to the client (0 if unknown).
+    fn video_backlog(&self) -> usize {
+        0
+    }
+
+    /// The largest video message since the last call, in bytes (0 if unknown).
+    fn take_video_max_bytes(&self) -> usize {
+        0
+    }
+
+    /// End this client's session: the transport stops reading and writing, so the handler and
+    /// its video thread end. Nothing happens where the transport cannot.
+    fn end_session(&self) {}
 }
 
 pub trait WeylusReceiver: Iterator<Item = Result<MessageInbound, Self::Error>> {
